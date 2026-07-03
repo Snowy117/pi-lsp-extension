@@ -94,6 +94,32 @@ export class LspClient {
     return new Map(this._diagnostics);
   }
 
+  /**
+   * Pull diagnostics for a document when the server supports LSP 3.17 diagnostic requests.
+   * Some servers (notably Roslyn) do not reliably push publishDiagnostics after every
+   * didChange in lightweight clients, so callers can force-refresh the cache.
+   */
+  async refreshDiagnostics(uri: string): Promise<Diagnostic[]> {
+    if (!this.connection || !this._initialized) {
+      return this.getDiagnostics(uri);
+    }
+
+    try {
+      const report = await this.connection.sendRequest<any>("textDocument/diagnostic", {
+        textDocument: { uri },
+      });
+
+      if (report?.kind === "full" && Array.isArray(report.items)) {
+        this._diagnostics.set(uri, report.items);
+        return report.items;
+      }
+    } catch {
+      // Server may not implement pull diagnostics; keep using publishDiagnostics cache.
+    }
+
+    return this.getDiagnostics(uri);
+  }
+
   /** Start the LSP server and perform the initialize handshake */
   async start(): Promise<void> {
     if (this._initialized || this._disposed) return;
@@ -315,6 +341,10 @@ export class LspClient {
           },
           publishDiagnostics: {
             relatedInformation: true,
+          },
+          diagnostic: {
+            dynamicRegistration: false,
+            relatedDocumentSupport: true,
           },
           completion: {
             completionItem: {

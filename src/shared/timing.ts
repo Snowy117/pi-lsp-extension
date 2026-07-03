@@ -3,7 +3,7 @@
  */
 
 /** Delay (ms) to wait for LSP to publish diagnostics after a file change */
-export const DIAGNOSTIC_SETTLE_DELAY_MS = 1500;
+export const DIAGNOSTIC_SETTLE_DELAY_MS = 8000;
 
 /** Delay (ms) to wait for a daemon socket to start listening after spawn */
 export const DAEMON_SOCKET_READY_DELAY_MS = 500;

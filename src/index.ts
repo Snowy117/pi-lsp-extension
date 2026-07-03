@@ -397,7 +397,7 @@ export default function lspExtension(pi: ExtensionAPI) {
       await new Promise((r) => setTimeout(r, DIAGNOSTIC_SETTLE_DELAY_MS));
 
       const uri = manager.getFileUri(path);
-      const diagnostics = client.getDiagnostics(uri);
+      const diagnostics = await client.refreshDiagnostics(uri);
       const errors = diagnostics.filter((d) => d.severity === DiagnosticSeverity.Error);
 
       if (errors.length === 0) return;

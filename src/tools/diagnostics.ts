@@ -75,7 +75,7 @@ export function createDiagnosticsTool(
       if (client) {
         // LSP path
         const uri = manager.getFileUri(filePath);
-        const diagnostics = client.getDiagnostics(uri);
+        const diagnostics = await client.refreshDiagnostics(uri);
 
         if (diagnostics.length === 0) {
           return { content: [{ type: "text", text: "No diagnostics (clean)." }], details: { count: 0 } };
