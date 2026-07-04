@@ -82,7 +82,7 @@ export class LspManager {
       ...DEFAULT_SERVERS,
       ...customConfigs,
     }));
-    this._workspace = workspace ?? new DefaultWorkspaceProvider();
+    this._workspace = workspace ?? new DefaultWorkspaceProvider(this.rootDir);
     this._callbacks = callbacks ?? {};
     this._sessionId = sessionId ?? `${process.pid}-${Date.now()}`;
   }
