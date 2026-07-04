@@ -398,23 +398,69 @@ export default function lspExtension(pi: ExtensionAPI) {
 
       const uri = manager.getFileUri(path);
       const diagnostics = await client.refreshDiagnostics(uri);
-      const errors = diagnostics.filter((d) => d.severity === DiagnosticSeverity.Error);
 
-      if (errors.length === 0) return;
+      // Severity bucketing: errors first, then everything else in severity
+      // order (Warning → Hint → Informational). Unspecified severity (0) is
+      // treated as Error per the LSP spec's default-severity rule.
+      const errors = diagnostics.filter(
+        (d) => !d.severity || d.severity === DiagnosticSeverity.Error
+      );
+      const others = diagnostics
+        .filter(
+          (d) =>
+            d.severity !== undefined &&
+            d.severity !== DiagnosticSeverity.Error
+        )
+        .sort((a, b) => (a.severity! - b.severity!));
 
-      // Build a compact summary — just errors, max 10 lines
+      if (errors.length === 0 && others.length === 0) return;
+
+      // Build a compact summary — errors first, then other severities,
+      // capped at MAX_DIAGNOSTIC_LINES total lines.
+      const MAX_DIAGNOSTIC_LINES = 20;
       const relPath = relative(manager.resolvePath("."), manager.resolvePath(path));
-      const lines = errors.slice(0, 10).map((d) => {
+
+      const severityLabel = (d: Diagnostic): string => {
+        switch (d.severity) {
+          case DiagnosticSeverity.Warning:
+            return "warning";
+          case DiagnosticSeverity.Hint:
+            return "hint";
+          case DiagnosticSeverity.Information:
+            return "info";
+          default:
+            return "error"; // Error or unspecified
+        }
+      };
+
+      const formatDiag = (d: Diagnostic): string => {
         const line = d.range.start.line + 1;
         const col = d.range.start.character + 1;
         const source = d.source ? ` [${d.source}]` : "";
-        return `${relPath}:${line}:${col} error: ${d.message}${source}`;
-      });
-      if (errors.length > 10) {
-        lines.push(`... and ${errors.length - 10} more error(s)`);
+        return `${relPath}:${line}:${col} ${severityLabel(d)}: ${d.message}${source}`;
+      };
+
+      const lines: string[] = [];
+      const total = errors.length + others.length;
+      let suppressed = 0;
+
+      for (const d of errors) {
+        if (lines.length >= MAX_DIAGNOSTIC_LINES) { suppressed = total - lines.length; break; }
+        lines.push(formatDiag(d));
+      }
+      if (lines.length < MAX_DIAGNOSTIC_LINES) {
+        for (const d of others) {
+          if (lines.length >= MAX_DIAGNOSTIC_LINES) { suppressed = total - lines.length; break; }
+          lines.push(formatDiag(d));
+        }
+      }
+      if (suppressed > 0) {
+        lines.push(`... and ${suppressed} more diagnostic(s)`);
       }
 
-      const summary = `\n\n⚠ LSP: ${errors.length} error(s) in ${relPath}:\n${lines.join("\n")}`;
+      const errorPart = errors.length > 0 ? `${errors.length} error(s)` : "no errors";
+      const otherPart = others.length > 0 ? `, ${others.length} other diagnostic(s)` : "";
+      const summary = `\n\n⚠ LSP: ${errorPart}${otherPart} in ${relPath}:\n${lines.join("\n")}`;
 
       return {
         content: [
