@@ -75,10 +75,14 @@ export function createDiagnosticsTool(
       if (client) {
         // LSP path
         const uri = manager.getFileUri(filePath);
-        const diagnostics = await client.refreshDiagnostics(uri);
+        const refreshResult = await client.refreshDiagnosticsWithFreshness(uri);
+        const diagnostics = refreshResult.diagnostics;
 
         if (diagnostics.length === 0) {
-          return { content: [{ type: "text", text: "No diagnostics (clean)." }], details: { count: 0 } };
+          const staleNote = refreshResult.fresh
+            ? ""
+            : ` [${refreshResult.staleReason ?? "results may be stale"}]`;
+          return { content: [{ type: "text", text: `No diagnostics (clean).${staleNote}` }], details: { count: 0 } };
         }
 
         const sorted = [...diagnostics].sort((a, b) => (a.severity ?? 99) - (b.severity ?? 99));
@@ -97,7 +101,10 @@ export function createDiagnosticsTool(
         ].filter(Boolean).join(", ");
 
         const truncation = truncateHead(output, { maxLines: DEFAULT_MAX_LINES, maxBytes: DEFAULT_MAX_BYTES });
-        let resultText = `${summary}\n\n${truncation.content}`;
+        const freshnessNote = refreshResult.fresh
+          ? ""
+          : `\n⚠ May be stale — ${refreshResult.staleReason ?? "results may be stale"}.`;
+        let resultText = `${summary}${freshnessNote}\n\n${truncation.content}`;
         if (truncation.truncated) {
           resultText += `\n\n[Output truncated: showing ${truncation.outputLines} of ${truncation.totalLines} diagnostics]`;
         }

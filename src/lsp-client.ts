@@ -28,6 +28,21 @@ import type {
   PublishDiagnosticsParams,
 } from "vscode-languageserver-protocol";
 
+/**
+ * Result of a diagnostic refresh attempt.
+ *
+ * `fresh === true` means the returned diagnostics were just computed by the
+ * server (full report) or the server explicitly confirmed they are unchanged
+ * at the current document version. `fresh === false` means we fell back to a
+ * possibly-stale cache; `staleReason` explains why.
+ */
+export interface DiagnosticRefreshResult {
+  diagnostics: Diagnostic[];
+  fresh: boolean;
+  /** Human-readable explanation when `fresh` is false. */
+  staleReason?: string;
+}
+
 export interface LspClientOptions {
   /** Command to start the LSP server */
   command: string;
@@ -57,6 +72,25 @@ export class LspClient {
   private connection: MessageConnection | null = null;
   private _serverCapabilities: ServerCapabilities | null = null;
   private _diagnostics: Map<string, Diagnostic[]> = new Map();
+  /**
+   * Per-URI `resultId` returned by the last full diagnostic report.
+   * Sent back as `previousResultId` on subsequent pull requests so the server
+   * can answer with `unchanged` instead of re-sending the full payload.
+   */
+  private _diagnosticResultIds: Map<string, string | undefined> = new Map();
+  /**
+   * Document version at which we last received a `full` diagnostic report for
+   * a URI. Used to decide whether a subsequent `unchanged` response is
+   * trustworthy (document hasn't changed) or suspect (server may simply not
+   * have finished re-analyzing the new version yet).
+   */
+  private _lastFullDiagnosticVersion: Map<string, number> = new Map();
+  /**
+   * Latest known version of each open document, mirrored from didOpen/didChange
+   * notifications so diagnostic freshness checks can compare against the
+   * version the server was told about.
+   */
+  private _documentVersions: Map<string, number> = new Map();
   private _initialized = false;
   private _disposed = false;
   /** True if connected to a daemon socket (server init handled by daemon) */
@@ -95,29 +129,108 @@ export class LspClient {
   }
 
   /**
-   * Pull diagnostics for a document when the server supports LSP 3.17 diagnostic requests.
-   * Some servers (notably Roslyn) do not reliably push publishDiagnostics after every
-   * didChange in lightweight clients, so callers can force-refresh the cache.
+   * Backwards-compatible wrapper: returns just the diagnostic array. Callers
+   * that care about freshness should use `refreshDiagnosticsWithFreshness`.
    */
   async refreshDiagnostics(uri: string): Promise<Diagnostic[]> {
+    const result = await this.refreshDiagnosticsWithFreshness(uri);
+    return result.diagnostics;
+  }
+
+  /**
+   * Pull fresh diagnostics for a document when the server supports LSP 3.17
+   * diagnostic requests. Returns a freshness flag so callers can surface
+   * "possibly stale" results instead of silently trusting the cache.
+   *
+   * Key correctness properties:
+   *  - Only sends `textDocument/diagnostic` when the server advertised
+   *    `diagnosticProvider` in its capabilities (no blind requests that fail
+   *    and silently fall through to the cache).
+   *  - Sends `previousResultId` so the server can answer `unchanged`.
+   *  - Treat an `unchanged` response as trustworthy only when the document
+   *    version matches the version at which the referenced report was
+   *    produced; otherwise the document has changed and the server may simply
+   *    not have finished re-analysis yet.
+   */
+  async refreshDiagnosticsWithFreshness(uri: string): Promise<DiagnosticRefreshResult> {
     if (!this.connection || !this._initialized) {
-      return this.getDiagnostics(uri);
+      return {
+        diagnostics: this.getDiagnostics(uri),
+        fresh: false,
+        staleReason: "LSP server not initialized; showing cached diagnostics",
+      };
+    }
+
+    // Capability gate: never fire pull requests at servers that don't support them.
+    const supportsPull = !!this._serverCapabilities?.diagnosticProvider;
+    if (!supportsPull) {
+      return {
+        diagnostics: this.getDiagnostics(uri),
+        fresh: false,
+        staleReason: "LSP server does not support pull diagnostics; showing last pushed diagnostics",
+      };
+    }
+
+    const previousResultId = this._diagnosticResultIds.get(uri);
+    const params: Record<string, unknown> = { textDocument: { uri } };
+    if (previousResultId !== undefined) {
+      params.previousResultId = previousResultId;
     }
 
     try {
-      const report = await this.connection.sendRequest<any>("textDocument/diagnostic", {
-        textDocument: { uri },
-      });
+      const report = await this.connection.sendRequest<any>("textDocument/diagnostic", params);
 
-      if (report?.kind === "full" && Array.isArray(report.items)) {
+      if (report && report.kind === "full" && Array.isArray(report.items)) {
         this._diagnostics.set(uri, report.items);
-        return report.items;
+        if (typeof report.resultId === "string") {
+          this._diagnosticResultIds.set(uri, report.resultId);
+        } else {
+          this._diagnosticResultIds.delete(uri);
+        }
+        const version = this._documentVersions.get(uri);
+        if (version !== undefined) {
+          this._lastFullDiagnosticVersion.set(uri, version);
+        }
+        return { diagnostics: report.items, fresh: true };
       }
-    } catch {
-      // Server may not implement pull diagnostics; keep using publishDiagnostics cache.
-    }
 
-    return this.getDiagnostics(uri);
+      if (report && report.kind === "unchanged") {
+        // Server claims the diagnostics equal the ones identified by the
+        // resultId we sent. Trust that only when the document version hasn't
+        // advanced past the version at which we received that full report —
+        // otherwise the doc changed and the server may not have re-analyzed
+        // the new version yet (heavy servers like Roslyn can return
+        // `unchanged` while incremental analysis is still in flight).
+        const currentVersion = this._documentVersions.get(uri);
+        const fullVersion = this._lastFullDiagnosticVersion.get(uri);
+        if (
+          currentVersion !== undefined &&
+          fullVersion !== undefined &&
+          currentVersion === fullVersion
+        ) {
+          return { diagnostics: this.getDiagnostics(uri), fresh: true };
+        }
+        return {
+          diagnostics: this.getDiagnostics(uri),
+          fresh: false,
+          staleReason:
+            "document changed since last full analysis; server reported unchanged, results may be stale",
+        };
+      }
+
+      // Unexpected response shape — don't trust it to overwrite the cache.
+      return {
+        diagnostics: this.getDiagnostics(uri),
+        fresh: false,
+        staleReason: "unexpected diagnostic response shape; showing cached diagnostics",
+      };
+    } catch {
+      return {
+        diagnostics: this.getDiagnostics(uri),
+        fresh: false,
+        staleReason: "pull diagnostics request failed; showing last pushed diagnostics",
+      };
+    }
   }
 
   /** Start the LSP server and perform the initialize handshake */
@@ -404,6 +517,7 @@ export class LspClient {
 
   /** Notify server of a newly opened document */
   didOpen(uri: string, languageId: string, version: number, text: string): void {
+    this._documentVersions.set(uri, version);
     this.sendNotification("textDocument/didOpen", {
       textDocument: { uri, languageId, version, text },
     });
@@ -411,6 +525,10 @@ export class LspClient {
 
   /** Notify server of a document change (full content sync) */
   didChange(uri: string, version: number, text: string): void {
+    this._documentVersions.set(uri, version);
+    // Drop the stale resultId/version anchors: the document changed, so any
+    // future `unchanged` response must be re-validated against the new version.
+    this._lastFullDiagnosticVersion.delete(uri);
     this.sendNotification("textDocument/didChange", {
       textDocument: { uri, version },
       contentChanges: [{ text }],
@@ -419,6 +537,10 @@ export class LspClient {
 
   /** Notify server of a closed document */
   didClose(uri: string): void {
+    this._documentVersions.delete(uri);
+    this._diagnostics.delete(uri);
+    this._diagnosticResultIds.delete(uri);
+    this._lastFullDiagnosticVersion.delete(uri);
     this.sendNotification("textDocument/didClose", {
       textDocument: { uri },
     });

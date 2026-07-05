@@ -31,6 +31,7 @@ import { DiagnosticSeverity, type Diagnostic } from "vscode-languageserver-proto
 
 import { LspManager, type ServerConfig, type LspManagerCallbacks } from "./lsp-manager.js";
 import { FileSync } from "./file-sync.js";
+import type { DiagnosticRefreshResult } from "./lsp-client.js";
 import { TreeSitterManager } from "./tree-sitter/parser-manager.js";
 import { WorkspaceIndex } from "./tree-sitter/workspace-index.js";
 import { type WorkspaceProvider, DefaultWorkspaceProvider } from "./workspace-provider.js";
@@ -50,6 +51,57 @@ import { relative } from "node:path";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { DIAGNOSTIC_SETTLE_DELAY_MS } from "./shared/timing.js";
+
+/**
+ * Poll the server for fresh diagnostics until it returns a `fresh` report
+ * (full report, or an `unchanged` confirmed against the current document
+ * version) or until the deadline expires.
+ *
+ * Heavy servers like Roslyn can still be mid-analysis after the initial
+ * settle delay; a single pull at that point returns either stale cached
+ * diagnostics or an `unchanged` whose resultId predates the edit. Polling
+ * until `fresh` avoids surfacing pre-edit diagnostics as if they were current.
+ *
+ * Each iteration re-resolves the client through the manager: a daemon socket
+ * may die and restart mid-poll, and pinning the dead instance would keep
+ * returning its stale cache. Re-resolution picks up the restarted client.
+ */
+async function pollForFreshDiagnostics(
+  manager: LspManager,
+  filePath: string,
+  uri: string,
+  options: { intervalMs?: number; deadlineMs?: number } = {},
+): Promise<DiagnosticRefreshResult> {
+  const intervalMs = options.intervalMs ?? 1000;
+  const deadlineMs = options.deadlineMs ?? (DIAGNOSTIC_SETTLE_DELAY_MS + 20_000);
+  const start = Date.now();
+
+  // Initial settle so the server has a chance to process the didChange before
+  // we start polling (otherwise the very first poll races the notification).
+  await new Promise((r) => setTimeout(r, DIAGNOSTIC_SETTLE_DELAY_MS));
+
+  for (;;) {
+    // Re-resolve the client every iteration. getClientForFile returns null
+    // while a restart is in flight; that counts as not-fresh and we retry.
+    const client = await manager.getClientForFile(filePath).catch(() => null);
+    if (client) {
+      const result = await client.refreshDiagnosticsWithFreshness(uri);
+      if (result.fresh) return result;
+    }
+    if (Date.now() - start >= deadlineMs) {
+      // Final attempt: return whatever the manager can give us so the caller
+      // can decide to surface a stale warning.
+      const finalClient = await manager.getClientForFile(filePath).catch(() => null);
+      if (finalClient) return await finalClient.refreshDiagnosticsWithFreshness(uri);
+      return {
+        diagnostics: [],
+        fresh: false,
+        staleReason: "LSP server unavailable after polling; no diagnostics injected",
+      };
+    }
+    await new Promise((r) => setTimeout(r, intervalMs));
+  }
+}
 
 /**
  * Project-level LSP config — loaded from `.pi-lsp.json` in the workspace root.
@@ -390,14 +442,32 @@ export default function lspExtension(pi: ExtensionAPI) {
       if (inject === false) return;
       if (Array.isArray(inject) && !inject.includes(languageId)) return;
 
-      const client = manager.getRunningClient(languageId);
+      // Use getClientForFile (not getRunningClient) so we await server startup
+      // instead of silently bailing when the daemon is mid-(re)handshake.
+      // (The actual client used for each poll is re-resolved inside
+      // pollForFreshDiagnostics to survive daemon restarts mid-poll.)
+      const client = await manager.getClientForFile(path).catch(() => null);
       if (!client) return;
 
-      // Wait briefly for the LSP to publish updated diagnostics
-      await new Promise((r) => setTimeout(r, DIAGNOSTIC_SETTLE_DELAY_MS));
-
       const uri = manager.getFileUri(path);
-      const diagnostics = await client.refreshDiagnostics(uri);
+      // Poll for fresh diagnostics instead of a single fixed delay: heavy
+      // servers (Roslyn) may still be mid-analysis 8s after didChange, in
+      // which case the first pull returns the stale cache or `unchanged`.
+      // We retry until the server returns a fresh report (full, or unchanged
+      // against the post-change version), with a total deadline to avoid
+      // blocking the tool result indefinitely.
+      //
+      // Each poll re-resolves the client through the manager so a daemon
+      // socket that died and is being restarted mid-poll is picked up
+      // instead of pinning the dead instance and returning its stale cache.
+      const refreshResult = await pollForFreshDiagnostics(manager, path, uri);
+      // If we could not obtain a fresh report (server not initialized, died,
+      // or timed out), do NOT inject potentially-stale diagnostics — the user
+      // can call lsp_diagnostics explicitly to confirm. Injecting cached
+      // pre-edit diagnostics after a fix is exactly the staleness bug we are
+      // solving.
+      if (!refreshResult.fresh) return;
+      const diagnostics = refreshResult.diagnostics;
 
       // Severity bucketing: errors first, then everything else in severity
       // order (Warning → Hint → Informational). Unspecified severity (0) is
@@ -437,7 +507,8 @@ export default function lspExtension(pi: ExtensionAPI) {
         const line = d.range.start.line + 1;
         const col = d.range.start.character + 1;
         const source = d.source ? ` [${d.source}]` : "";
-        return `${relPath}:${line}:${col} ${severityLabel(d)}: ${d.message}${source}`;
+        const code = d.code !== undefined ? ` (${d.code})` : "";
+        return `${relPath}:${line}:${col} ${severityLabel(d)}: ${d.message}${code}${source}`;
       };
 
       const lines: string[] = [];
@@ -460,7 +531,10 @@ export default function lspExtension(pi: ExtensionAPI) {
 
       const errorPart = errors.length > 0 ? `${errors.length} error(s)` : "no errors";
       const otherPart = others.length > 0 ? `, ${others.length} other diagnostic(s)` : "";
-      const summary = `\n\n⚠ LSP: ${errorPart}${otherPart} in ${relPath}:\n${lines.join("\n")}`;
+      const freshnessNote = refreshResult.fresh
+        ? ""
+        : ` [may be stale — ${refreshResult.staleReason ?? "results may be stale"}; run lsp_diagnostics to confirm]`;
+      const summary = `\n\n⚠ LSP: ${errorPart}${otherPart} in ${relPath}${freshnessNote}:\n${lines.join("\n")}`;
 
       return {
         content: [
