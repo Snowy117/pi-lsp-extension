@@ -16,7 +16,7 @@ export interface ResolvedPosition {
   line: number;       // 1-indexed (tool convention)
   character: number;  // 1-indexed
   symbolName: string;
-  source: "lsp" | "tree-sitter";
+  source: "lsp" | "tree-sitter" | "text";
 }
 
 type DocumentSymbolResponse = DocumentSymbol[] | SymbolInformation[] | null;
@@ -73,6 +73,22 @@ export async function resolveSymbolPosition(
     } catch { /* fall through */ }
   }
 
+  // Text-scan fallback: locate the query as a whole-word identifier occurrence in
+  // the file. LSP documentSymbol/tree-sitter only know about *declarations* in
+  // this file; a query like an interface name used as a base type, or a type
+  // reference inside a method signature, is not a declaration and so is invisible
+  // to both. Scanning the raw text for the identifier is the only reliable way to
+  // resolve such references to a position the LSP can then hover/define/references
+  // on. We prefer the first occurrence outside comments/strings when possible.
+  try {
+    const absPath = manager.resolvePath(filePath);
+    const content = await readFile(absPath, "utf-8");
+    const pos = findIdentifierOccurrence(content, query);
+    if (pos) {
+      return { line: pos.line, character: pos.character, symbolName: query, source: "text" };
+    }
+  } catch { /* fall through */ }
+
   return null;
 }
 
@@ -93,8 +109,20 @@ export async function getSymbolNames(
         { textDocument: { uri } }
       );
       if (symbols && symbols.length > 0) {
+        // Recurse into hierarchical DocumentSymbols so callers see nested class/method
+        // names, not just the top-level namespace. Without this recursion the hint
+        // only ever shows the namespace, which is misleading. SymbolInformation (flat)
+        // has no children to walk.
         if ("selectionRange" in symbols[0]) {
-          return (symbols as DocumentSymbol[]).map(s => s.name);
+          const names: string[] = [];
+          const walk = (syms: DocumentSymbol[]): void => {
+            for (const s of syms) {
+              names.push(s.name);
+              if (s.children) walk(s.children);
+            }
+          };
+          walk(symbols as DocumentSymbol[]);
+          return names;
         }
         return (symbols as SymbolInformation[]).map(s => s.name);
       }
@@ -257,9 +285,52 @@ function matchByPriority(
   const caseInsensitive = candidates.find(c => c.name.toLowerCase() === queryLower);
   if (caseInsensitive) return { line: caseInsensitive.line, character: caseInsensitive.character, symbolName: caseInsensitive.name, source };
 
-  // 3. Substring match (case-insensitive)
-  const substring = candidates.find(c => c.name.toLowerCase().includes(queryLower));
-  if (substring) return { line: substring.line, character: substring.character, symbolName: substring.name, source };
+  // 3. Prefix match (case-insensitive). Restricted to a *prefix* of the symbol
+  // name rather than an arbitrary substring: an arbitrary-substring match lets
+  // a type referenced inside a method signature (e.g. `ExpertCompletionResult`
+  // appearing in `CompleteAsync`'s `Task<ExpertCompletionResult>` return type)
+  // falsely match the enclosing method when its serialized signature happens to
+  // contain the type name. Prefix matching keeps short queries useful ("Expert"
+  // still matches "ExpertBase") while avoiding signature-content false matches.
+  const prefix = candidates.find(c => c.name.toLowerCase().startsWith(queryLower));
+  if (prefix) return { line: prefix.line, character: prefix.character, symbolName: prefix.name, source };
 
   return null;
+}
+
+/**
+ * Find the first whole-word occurrence of `identifier` in `content` as a
+ * line/character position (1-indexed), skipping lines that look like comments
+ * when a non-comment occurrence exists. Used as the last-resort fallback in
+ * resolveSymbolPosition to locate *referenced* symbols (not declarations),
+ * which documentSymbol/tree-sitter cannot see.
+ */
+function findIdentifierOccurrence(
+  content: string,
+  identifier: string,
+): { line: number; character: number } | null {
+  // \b in JS regex is Unicode-aware by default for ASCII word chars, which is
+  // exactly what we want for typical identifiers (letters, digits, underscore).
+  // Escape the identifier in case it contains regex metacharacters.
+  const escaped = identifier.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const re = new RegExp(`(?<![A-Za-z0-9_])${escaped}(?![A-Za-z0-9_])`, "g");
+
+  const lines = content.split("\n");
+  let fallback: { line: number; character: number } | null = null;
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    let match: RegExpExecArray | null;
+    re.lastIndex = 0;
+    while ((match = re.exec(line)) !== null) {
+      const pos = { line: i + 1, character: match.index + 1 };
+      const trimmed = line.trimStart();
+      // Skip obvious comment lines (// or /* or * or ' in VB-like, or #region/#pragma).
+      // Keep occurrences inside code even if a // appears later on the same line.
+      const isCommentLine = /^(\/\/|\/\*|\*|#)/.test(trimmed);
+      if (!isCommentLine) return pos;
+      if (!fallback) fallback = pos;
+    }
+  }
+  return fallback;
 }

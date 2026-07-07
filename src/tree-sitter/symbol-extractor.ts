@@ -89,6 +89,29 @@ const JAVA_SYMBOLS: SymbolMapping[] = [
   { nodeType: "annotation_type_declaration", kind: SymbolKind.Interface },
 ];
 
+// C# declaration nodes per the tree-sitter-c-sharp grammar. The `name` field
+// is used for the symbol name; these cover namespaces, types, methods, fields,
+// and properties — enough for query resolution and workspace indexing.
+const CSHARP_SYMBOLS: SymbolMapping[] = [
+  { nodeType: "namespace_declaration", kind: SymbolKind.Namespace, recurse: true },
+  { nodeType: "class_declaration", kind: SymbolKind.Class, recurse: true },
+  { nodeType: "interface_declaration", kind: SymbolKind.Interface, recurse: true },
+  { nodeType: "struct_declaration", kind: SymbolKind.Struct, recurse: true },
+  { nodeType: "enum_declaration", kind: SymbolKind.Enum, recurse: true },
+  { nodeType: "record_declaration", kind: SymbolKind.Class, recurse: true },
+  { nodeType: "method_declaration", kind: SymbolKind.Method },
+  { nodeType: "constructor_declaration", kind: SymbolKind.Constructor },
+  { nodeType: "destructor_declaration", kind: SymbolKind.Method },
+  { nodeType: "property_declaration", kind: SymbolKind.Property },
+  { nodeType: "indexer_declaration", kind: SymbolKind.Property },
+  { nodeType: "operator_declaration", kind: SymbolKind.Function },
+  { nodeType: "conversion_operator_declaration", kind: SymbolKind.Function },
+  { nodeType: "event_declaration", kind: SymbolKind.Field },
+  { nodeType: "field_declaration", kind: SymbolKind.Field },
+  { nodeType: "event_field_declaration", kind: SymbolKind.Field },
+  { nodeType: "delegate_declaration", kind: SymbolKind.Function },
+];
+
 const C_CPP_SYMBOLS: SymbolMapping[] = [
   { nodeType: "function_definition", kind: SymbolKind.Function },
   { nodeType: "declaration", kind: SymbolKind.Variable },
@@ -116,6 +139,7 @@ const LANGUAGE_SYMBOLS: Record<string, SymbolMapping[]> = {
   java: JAVA_SYMBOLS,
   c: C_CPP_SYMBOLS,
   cpp: C_CPP_SYMBOLS,
+  csharp: CSHARP_SYMBOLS,
   ruby: RUBY_SYMBOLS,
 };
 

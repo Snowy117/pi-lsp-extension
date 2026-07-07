@@ -183,6 +183,20 @@ function getWrappersForLanguage(languageId: string): Array<{
         { wrap: (s: string) => `(${s})`, unwrap: unwrapExpression },
         { wrap: (s: string) => `def _():\n  ${s}`, unwrap: unwrapPythonFunctionBody },
       ];
+    case "csharp":
+      // C# requires declarations to live inside a class/struct, statements inside a
+      // method body, and the grammar has no top-level statements. The wrappers
+      // below cover the common fragment kinds: a declaration (class/method/field)
+      // goes inside a class shell; a statement or expression goes inside a method
+      // body inside that class shell. Each is tried in order of specificity.
+      return [
+        // Full type declaration (class/interface/struct/enum/record/delegate already complete)
+        { wrap: (s: string) => `class __P { ${s} }`, unwrap: unwrapCSharpClassMember },
+        // Statement fragment (e.g. `return ...;`, `if (...) { ... }`)
+        { wrap: (s: string) => `class __P { void __M() { ${s} } }`, unwrap: unwrapCSharpStatement },
+        // Expression fragment (e.g. `a + b`, `foo(x)`)
+        { wrap: (s: string) => `class __P { void __M() { var __v = ${s}; } }`, unwrap: unwrapCSharpExpression },
+      ];
     default:
       return [
         ...common,
@@ -336,6 +350,76 @@ function unwrapPythonFunctionBody(root: SyntaxNode): SyntaxNode | null {
   const body = fn.childForFieldName("body");
   if (!body || body.namedChildCount === 0) return null;
   const stmt = body.namedChildren[0];
+  if (stmt.type === "expression_statement" && stmt.namedChildCount === 1) {
+    return stmt.namedChildren[0];
+  }
+  return stmt;
+}
+
+/**
+ * Unwrap a C# class-member fragment wrapped as `class __P { <fragment> }`.
+ * Root is compilation_unit → class_declaration → body (declaration_list) → first member.
+ * Returns the member directly (method/class/field/etc.) without further unwrapping.
+ */
+function unwrapCSharpClassMember(root: SyntaxNode): SyntaxNode | null {
+  // tree-sitter-c-sharp uses "compilation_unit" as the root node type.
+  if (root.type !== "compilation_unit" || root.namedChildCount === 0) return null;
+  const cls = root.namedChildren[0];
+  if (cls.type !== "class_declaration") return null;
+  const body = cls.childForFieldName("body");
+  if (!body || body.namedChildCount === 0) return null;
+  return body.namedChildren[0];
+}
+
+/**
+ * Unwrap a C# statement fragment wrapped as `class __P { void __M() { <stmt> } }`.
+ * compilation_unit → class_declaration → body → method_declaration → body (block) → first statement.
+ * If the statement is an expression_statement, unwrap to the inner expression so
+ * expression patterns also match via this wrapper.
+ */
+function unwrapCSharpStatement(root: SyntaxNode): SyntaxNode | null {
+  if (root.type !== "compilation_unit" || root.namedChildCount === 0) return null;
+  const cls = root.namedChildren[0];
+  if (cls.type !== "class_declaration") return null;
+  const body = cls.childForFieldName("body");
+  if (!body || body.namedChildCount === 0) return null;
+  const method = body.namedChildren[0];
+  if (method.type !== "method_declaration") return null;
+  const methodBody = method.childForFieldName("body");
+  if (!methodBody || methodBody.namedChildCount === 0) return null;
+  const stmt = methodBody.namedChildren[0];
+  if (stmt.type === "expression_statement" && stmt.namedChildCount === 1) {
+    return stmt.namedChildren[0];
+  }
+  return stmt;
+}
+
+/**
+ * Unwrap a C# expression fragment wrapped as `class __P { void __M() { var __v = <expr>; } }`.
+ * Same path as statements, but the first statement is a local_declaration whose
+ * value is the matched expression.
+ */
+function unwrapCSharpExpression(root: SyntaxNode): SyntaxNode | null {
+  if (root.type !== "compilation_unit" || root.namedChildCount === 0) return null;
+  const cls = root.namedChildren[0];
+  if (cls.type !== "class_declaration") return null;
+  const body = cls.childForFieldName("body");
+  if (!body || body.namedChildCount === 0) return null;
+  const method = body.namedChildren[0];
+  if (method.type !== "method_declaration") return null;
+  const methodBody = method.childForFieldName("body");
+  if (!methodBody || methodBody.namedChildCount === 0) return null;
+  const stmt = methodBody.namedChildren[0];
+  // var __v = <expr>;  → variable_declaration → variable_declarator → value (the expression)
+  // Tree-sitter-c-sharp node names: "local_declaration_statement" wraps a "variable_declaration".
+  const decl = stmt.type === "local_declaration_statement" ? stmt.namedChildren[0] : stmt;
+  if (decl && decl.type === "variable_declaration" && decl.namedChildCount > 0) {
+    const declarator = decl.namedChildren[decl.namedChildCount - 1];
+    if (declarator.type === "variable_declarator") {
+      const value = declarator.childForFieldName("value");
+      if (value) return value;
+    }
+  }
   if (stmt.type === "expression_statement" && stmt.namedChildCount === 1) {
     return stmt.namedChildren[0];
   }

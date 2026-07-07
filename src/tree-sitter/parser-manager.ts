@@ -27,6 +27,11 @@ const LANGUAGE_TO_GRAMMAR: Record<string, string> = {
   java: "tree-sitter-java.wasm",
   c: "tree-sitter-c.wasm",
   cpp: "tree-sitter-cpp.wasm",
+  // The tree-sitter-wasms package ships the C# grammar as tree-sitter-c_sharp.wasm.
+  // Without this entry, hasGrammar("csharp") is false, so query resolution
+  // (hover/definition/references by symbol name) and ast_search/code_rewrite
+  // all silently fall back to nothing for every .cs file.
+  csharp: "tree-sitter-c_sharp.wasm",
   ruby: "tree-sitter-ruby.wasm",
   kotlin: "tree-sitter-kotlin.wasm",
   scala: "tree-sitter-scala.wasm",
