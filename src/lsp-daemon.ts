@@ -332,6 +332,17 @@ async function initializeLsp(): Promise<void> {
           documentSymbol: { hierarchicalDocumentSymbolSupport: true },
           rename: { prepareSupport: false },
           publishDiagnostics: { relatedInformation: true },
+          // Pull diagnostics capability. The daemon performs the initialize
+          // handshake with the server, so the capabilities declared HERE are
+          // what the server sees — not the per-client capabilities registered
+          // in LspClient. Without this, the server concludes the client can't
+          // pull diagnostics, refreshDiagnosticsWithFreshness falls back to the
+          // stale pushed cache, and post-write diagnostic auto-injection
+          // returns "no diagnostics (clean)" even for files with errors.
+          diagnostic: {
+            dynamicRegistration: false,
+            relatedDocumentSupport: true,
+          },
           completion: { completionItem: { snippetSupport: false } },
         },
         workspace: { workspaceFolders: true, symbol: {}, configuration: true },
