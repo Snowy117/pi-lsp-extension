@@ -11,7 +11,6 @@
 
 import { spawn, type ChildProcess } from "node:child_process";
 import { connect as netConnect, type Socket } from "node:net";
-import { appendFile } from "node:fs/promises";
 import { pathToFileURL } from "node:url";
 import {
   createMessageConnection,
@@ -164,7 +163,6 @@ export class LspClient {
 
     // Capability gate: never fire pull requests at servers that don't support them.
     const supportsPull = !!this._serverCapabilities?.diagnosticProvider;
-    appendFile("/tmp/pi-lsp-client-debug.log", `[${new Date().toISOString()}] refreshDiagnostics uri=${uri.slice(-40)} supportsPull=${supportsPull} isDaemon=${this._isDaemonClient} capsNull=${this._serverCapabilities === null}\n`).catch(()=>{});
     if (!supportsPull) {
       return {
         diagnostics: this.getDiagnostics(uri),
@@ -304,7 +302,6 @@ export class LspClient {
       (params: { capabilities: ServerCapabilities }) => {
         if (params?.capabilities) {
           this._serverCapabilities = params.capabilities;
-          appendFile("/tmp/pi-lsp-client-debug.log", `[${new Date().toISOString()}] received capabilities: diagnosticProvider=${!!(params.capabilities as any).diagnosticProvider}\n`).catch(()=>{});
         }
       },
     );
