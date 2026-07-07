@@ -24,6 +24,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { unlinkSync, existsSync, writeFileSync, mkdirSync, appendFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { pathToFileURL } from "node:url";
+import type { ServerCapabilities } from "vscode-languageserver-protocol";
 
 // ── LSP Message Framing ────────────────────────────────────────────────────
 
@@ -136,6 +137,13 @@ let settings: Record<string, unknown> | undefined;
 let shutdownTimer: ReturnType<typeof setTimeout> | null = null;
 let server: Server;
 let lspProcess: ChildProcess;
+/**
+ * Server capabilities captured from the initialize handshake. The daemon does
+ * the handshake once; each client that later connects over the socket needs
+ * these to gate capability-aware code paths (e.g. pull diagnostics). Handed
+ * to clients via the $/pi-lsp/serverCapabilities notification on connect.
+ */
+let cachedServerCapabilities: ServerCapabilities | null = null;
 let lspParser: MessageParser;
 let lspInitialized = false;
 /** The request ID used for the initialize handshake (set by initializeLsp) */
@@ -204,6 +212,17 @@ function handleServerMessage(msg: JsonRpcMessage): void {
     if (initRequestId !== null && msg.id === initRequestId && !msg.method) {
       lspInitialized = true;
       initRequestId = null;
+
+      // Cache server capabilities so we can hand them to clients that connect
+      // later. The daemon performs the single initialize handshake; without
+      // this cache, each LspClient connecting over the socket would have a
+      // null _serverCapabilities and every capability-gated code path
+      // (notably pull diagnostics: refreshDiagnosticsWithFreshness) would
+      // falsely conclude the server doesn't support it.
+      const initResult = msg.result as { capabilities?: ServerCapabilities } | undefined;
+      if (initResult?.capabilities) {
+        cachedServerCapabilities = initResult.capabilities;
+      }
 
       // Send initialized notification
       lspProcess.stdin!.write(encodeMessage({
@@ -412,6 +431,18 @@ function startSocketServer(): Server {
 
     const conn: ClientConnection = { id: clientId, socket, parser };
     clients.set(clientId, conn);
+
+    // Hand the cached server capabilities to this client. The daemon did the
+    // initialize handshake; this is how the client learns what the server can
+    // do (pull diagnostics, hover, definition, etc.) without performing its
+    // own handshake, which the daemon would reject.
+    if (cachedServerCapabilities) {
+      socket.write(encodeMessage({
+        jsonrpc: "2.0",
+        method: "$/pi-lsp/serverCapabilities",
+        params: { capabilities: cachedServerCapabilities },
+      }));
+    }
 
     socket.on("data", (data) => parser.feed(Buffer.from(data)));
 

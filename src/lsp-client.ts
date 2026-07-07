@@ -291,6 +291,21 @@ export class LspClient {
     // unhandled notifications or errors.
     this.connection.onNotification("$/progress", () => {});
 
+    // In daemon mode, the daemon performs the initialize handshake and caches
+    // the server capabilities. It pushes them to each connecting client via
+    // this custom notification. Without it, a daemon client's
+    // _serverCapabilities stays null and capability-gated paths (notably pull
+    // diagnostics) falsely report "server does not support" it. In direct mode
+    // this notification never arrives, so the handler is harmless.
+    this.connection.onNotification(
+      "$/pi-lsp/serverCapabilities",
+      (params: { capabilities: ServerCapabilities }) => {
+        if (params?.capabilities) {
+          this._serverCapabilities = params.capabilities;
+        }
+      },
+    );
+
     // Handle connection-level errors to prevent unhandled exceptions
     this.connection.onError(([err]) => {
       console.error(`[LSP ${this.languageId}] Connection error: ${err.message}`);
