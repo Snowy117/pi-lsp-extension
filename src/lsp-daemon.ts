@@ -335,6 +335,13 @@ async function initializeLsp(): Promise<void> {
           completion: { completionItem: { snippetSupport: false } },
         },
         workspace: { workspaceFolders: true, symbol: {}, configuration: true },
+        // Roslyn gates solution/project loading behind workDoneProgress; without
+        // this capability the server never sends `workDoneProgress/create` and
+        // silently skips loading (no projects, no workspace symbols, no
+        // cross-file navigation). The daemon forwards the create request to the
+        // first connected client, whose handler (registered in LspClient)
+        // acknowledges it.
+        window: { workDoneProgress: true },
       },
       rootUri,
       workspaceFolders,

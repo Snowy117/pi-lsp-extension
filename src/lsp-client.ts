@@ -272,6 +272,25 @@ export class LspClient {
       }
     );
 
+    // Handle window/workDoneProgress/create requests from servers (e.g. Roslyn).
+    // Roslyn's AutoLoadProjectsInitializer creates a workDoneProgress before
+    // loading a solution and awaits its creation; if the client never responds,
+    // the entire solution load hangs silently (the load runs fire-and-forget,
+    // and the hang produces no error and no project files are ever opened).
+    // We don't render a progress bar — acknowledging creation (null result) is
+    // enough for the server to proceed. This handler is required in BOTH direct
+    // mode (server speaks to this client directly) and daemon mode (the daemon
+    // forwards server-initiated requests to this client).
+    this.connection.onRequest(
+      "window/workDoneProgress/create",
+      (_params: { token: number | string }) => null,
+    );
+
+    // Swallow $/progress notifications (begin/report/end). A status bar could
+    // render these; we just accept and ignore them so they don't surface as
+    // unhandled notifications or errors.
+    this.connection.onNotification("$/progress", () => {});
+
     // Handle connection-level errors to prevent unhandled exceptions
     this.connection.onError(([err]) => {
       console.error(`[LSP ${this.languageId}] Connection error: ${err.message}`);
@@ -469,6 +488,13 @@ export class LspClient {
           workspaceFolders: true,
           symbol: {},
           configuration: true,
+        },
+        window: {
+          // Roslyn (rasls) gates solution/project loading behind
+          // workDoneProgress: it sends `window/workDoneProgress/create` before
+          // starting a load and hangs indefinitely if the client never responds.
+          // Declaring this capability tells the server it may create progress.
+          workDoneProgress: true,
         },
       },
       rootUri,
