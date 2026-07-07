@@ -187,6 +187,7 @@ function clientToServer(clientId: number, msg: JsonRpcMessage): void {
     const daemonId = nextDaemonRequestId++;
     pendingRequests.set(daemonId, { clientId, originalId: msg.id });
     const rewritten = { ...msg, id: daemonId };
+    debugLog(`client ${clientId} -> server: request ${msg.method} (id ${msg.id} -> daemon ${daemonId})`);
     lspProcess.stdin.write(encodeMessage(rewritten));
   } else if (msg.id !== undefined && !msg.method) {
     // Response from client to a server-initiated request — relay back to LSP server
@@ -196,6 +197,7 @@ function clientToServer(clientId: number, msg: JsonRpcMessage): void {
     }
   } else {
     // Notification from client — forward as-is
+    debugLog(`client ${clientId} -> server: notification ${msg.method}`);
     lspProcess.stdin.write(encodeMessage(msg));
   }
 }
@@ -222,6 +224,25 @@ function handleServerMessage(msg: JsonRpcMessage): void {
       const initResult = msg.result as { capabilities?: ServerCapabilities } | undefined;
       if (initResult?.capabilities) {
         cachedServerCapabilities = initResult.capabilities;
+        debugLog(`cached capabilities: diagnosticProvider=${!!(cachedServerCapabilities as any).diagnosticProvider}, hoverProvider=${!!(cachedServerCapabilities as any).hoverProvider}`);
+        // Broadcast capabilities to clients that connected BEFORE the handshake
+        // completed. Client connect typically races with init: the client opens
+        // the socket as soon as the daemon listens, which is before the daemon
+        // has the init response. So the connect-time push misses early clients.
+        // Re-broadcast here so every already-connected client receives them.
+        const capsMsg = encodeMessage({
+          jsonrpc: "2.0",
+          method: "$/pi-lsp/serverCapabilities",
+          params: { capabilities: cachedServerCapabilities },
+        });
+        for (const c of clients.values()) {
+          if (!c.socket.destroyed) {
+            c.socket.write(capsMsg);
+          }
+        }
+        debugLog(`broadcast capabilities to ${clients.size} connected client(s)`);
+      } else {
+        debugLog(`init result had no capabilities field`);
       }
 
       // Send initialized notification
@@ -252,16 +273,21 @@ function serverToClients(msg: JsonRpcMessage): void {
     if (pending) {
       pendingRequests.delete(msg.id);
       const client = clients.get(pending.clientId);
+      debugLog(`server -> client ${pending.clientId}: response (daemon ${msg.id} -> orig ${pending.originalId})`);
       if (client && !client.socket.destroyed) {
         const rewritten = { ...msg, id: pending.originalId };
         client.socket.write(encodeMessage(rewritten));
       }
+    } else {
+      debugLog(`server -> ?: response with no pending request (daemon id ${msg.id}) — DROPPED`);
     }
   } else if (msg.id !== undefined && msg.method) {
     // Server-initiated request (e.g. workspace/configuration) — handle locally or forward to a client
+    debugLog(`server -> client: request ${msg.method} (id ${msg.id})`);
     handleServerRequest(msg);
   } else if (msg.method && msg.id === undefined) {
     // Notification from server — broadcast to ALL clients
+    debugLog(`server -> all clients: notification ${msg.method}`);
     const encoded = encodeMessage(msg);
     for (const client of clients.values()) {
       if (!client.socket.destroyed) {
@@ -437,11 +463,14 @@ function startSocketServer(): Server {
     // do (pull diagnostics, hover, definition, etc.) without performing its
     // own handshake, which the daemon would reject.
     if (cachedServerCapabilities) {
+      debugLog(`pushing capabilities to client ${clientId}`);
       socket.write(encodeMessage({
         jsonrpc: "2.0",
         method: "$/pi-lsp/serverCapabilities",
         params: { capabilities: cachedServerCapabilities },
       }));
+    } else {
+      debugLog(`client ${clientId} connected but no cached capabilities yet`);
     }
 
     socket.on("data", (data) => parser.feed(Buffer.from(data)));
@@ -490,6 +519,15 @@ function startSocketServer(): Server {
 function log(msg: string): void {
   const ts = new Date().toISOString();
   const logPath = socketPath.replace(/\.sock$/, ".log");
+  try {
+    appendFileSync(logPath, `[${ts}] ${msg}\n`);
+  } catch { /* ignore */ }
+}
+
+/** Debug helper: log to a separate debug file with a [DEBUG] tag. */
+function debugLog(msg: string): void {
+  const ts = new Date().toISOString();
+  const logPath = socketPath.replace(/\.sock$/, ".debug.log");
   try {
     appendFileSync(logPath, `[${ts}] ${msg}\n`);
   } catch { /* ignore */ }

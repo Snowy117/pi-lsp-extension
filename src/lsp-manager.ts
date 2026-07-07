@@ -7,7 +7,7 @@
 
 import { resolve, join, dirname } from "node:path";
 import { pathToFileURL } from "node:url";
-import { existsSync, readFileSync, readdirSync, unlinkSync } from "node:fs";
+import { closeSync, existsSync, openSync, readFileSync, readdirSync, unlinkSync } from "node:fs";
 import { spawn as spawnChild } from "node:child_process";
 import { LspClient } from "./lsp-client.js";
 import { type WorkspaceProvider, DefaultWorkspaceProvider } from "./workspace-provider.js";
@@ -410,7 +410,21 @@ export class LspManager {
     if (stateDir) {
       // Spawn daemon and connect via socket
       try {
-        await this.spawnDaemon(languageId, config, effectiveArgs, workspaceFolders, initializationOptions);
+        // Acquire a spawn lock to prevent multiple pi processes from each
+        // spawning a daemon when they start concurrently (classic TOCTOU:
+        // both see isDaemonAlive=false, both spawn, both bind the same socket,
+        // one wins and the other's daemon is orphaned or half-initialized).
+        // The winner spawns; losers skip the spawn and enter the shared
+        // connect-retry loop below to pick up the winner's daemon.
+        const lockPath = this.getSocketPath(languageId)!.replace(/\.sock$/, ".spawn.lock");
+        const spawnedByUs = await this.tryAcquireSpawnLock(lockPath);
+        if (spawnedByUs) {
+          try {
+            await this.spawnDaemon(languageId, config, effectiveArgs, workspaceFolders, initializationOptions);
+          } finally {
+            this.releaseSpawnLock(lockPath);
+          }
+        }
         // Small delay to let daemon start listening
         await new Promise((r) => setTimeout(r, DAEMON_SOCKET_READY_DELAY_MS));
 
@@ -506,6 +520,44 @@ export class LspManager {
     const stateDir = this._workspace.stateDir;
     if (!stateDir) return null;
     return join(stateDir, "sockets", `lsp-${languageId}.sock`);
+  }
+
+  /**
+   * Atomically acquire a spawn lock so only one pi process spawns the daemon.
+   * Uses O_EXCL ("wx") file creation: exactly one process succeeds; others get
+   * EEXIST. The lock auto-expires in spirit — if the winner crashes, a stale
+   * lock file remains, but spawnDaemon failure / daemon death causes the
+   * connect loop to time out and the next startServer attempt removes and
+   * re-creates it. We treat a lock older than DAEMON_MAX_RETRIES * interval as
+   * stale and break it.
+   */
+  private async tryAcquireSpawnLock(lockPath: string): Promise<boolean> {
+    try {
+      const fd = openSync(lockPath, "wx");
+      closeSync(fd);
+      return true;
+    } catch (err: any) {
+      if (err.code === "EEXIST") {
+        // Stale-lock recovery: if the lock is older than the worst-case spawn
+        // window, assume the previous winner died and take over.
+        try {
+          const { statSync } = await import("node:fs");
+          const ageMs = Date.now() - statSync(lockPath).mtimeMs;
+          const staleThreshold = (DAEMON_MAX_RETRIES * DAEMON_RETRY_INTERVAL_MS) + DAEMON_SOCKET_READY_DELAY_MS + 5_000;
+          if (ageMs > staleThreshold) {
+            unlinkSync(lockPath);
+            return this.tryAcquireSpawnLock(lockPath);
+          }
+        } catch { /* ignore stat/unlink failures */ }
+        return false;
+      }
+      throw err;
+    }
+  }
+
+  /** Release the spawn lock after the daemon is up (or failed). */
+  private releaseSpawnLock(lockPath: string): void {
+    try { unlinkSync(lockPath); } catch { /* already gone */ }
   }
 
   /** Check if a daemon is alive for this language */
