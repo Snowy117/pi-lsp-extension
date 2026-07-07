@@ -10,8 +10,9 @@
 
 import { tmpdir, hostname } from "node:os";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 
 /**
  * Resolve a per-workspace state directory for daemon sockets / PIDs.
@@ -56,6 +57,72 @@ function resolveStateDir(workspaceRoot: string): string | null {
   return join(cacheDir, "pi-lsp", hostHash, rootHash);
 }
 
+/**
+ * Resolve the canonical project root for daemon-sharing purposes.
+ *
+ * The problem this solves: subagents and other pi processes may have a cwd
+ * that is NOT the project root (e.g. a git worktree, or a /tmp work dir used
+ * by pi-subagents). If stateDir were derived from cwd directly, every such
+ * process would resolve a different stateDir and spawn its own daemon —
+ * defeating daemon sharing entirely.
+ *
+ * Resolution order:
+ *  1. PI_LSP_PROJECT_ROOT env var — explicit override (lets orchestrators
+ *     like pi-subagents pass the real project root even when cwd is /tmp).
+ *  2. Walk up from `dir` looking for `.git`:
+ *     - `.git` directory  → this is the repository root.
+ *     - `.git` file (git worktree) → contains `gitdir: <main>/.git/worktrees/<name>`;
+ *       walk up from that gitdir until we find a directory whose `.git` is a
+ *       directory, i.e. the main worktree (repository root).
+ *  3. Fallback: `dir` itself (no project root detectable).
+ */
+function resolveProjectRoot(dir: string): string {
+  const envRoot = process.env.PI_LSP_PROJECT_ROOT;
+  if (envRoot && envRoot.trim()) {
+    return resolve(envRoot.trim());
+  }
+
+  let current = resolve(dir);
+  // Guard: avoid infinite loop at filesystem root.
+  for (;;) {
+    const dotGit = join(current, ".git");
+    if (existsSync(dotGit)) {
+      let isDir = false;
+      try { isDir = statSync(dotGit).isDirectory(); } catch { /* not statable */ }
+      if (isDir) {
+        return current; // main worktree / ordinary clone
+      }
+      // .git is a file → git worktree. Read it to find the main repository.
+      try {
+        const content = readFileSync(dotGit, "utf-8").trim();
+        const m = content.match(/^gitdir:\s*(.+)$/);
+        if (m) {
+          // gitdirPath is typically <mainRepo>/.git/worktrees/<name>
+          let search = dirname(m[1]);
+          for (;;) {
+            const candidate = join(search, ".git");
+            if (existsSync(candidate)) {
+              try {
+                if (statSync(candidate).isDirectory()) return search;
+              } catch { /* keep walking */ }
+            }
+            const parent = dirname(search);
+            if (parent === search) break;
+            search = parent;
+          }
+        }
+      } catch { /* ignore unreadable .git file */ }
+      // Worktree gitdir resolution failed — fall back to the worktree root,
+      // which at least keeps this one process self-consistent.
+      return current;
+    }
+    const parent = dirname(current);
+    if (parent === current) break; // reached filesystem root
+    current = parent;
+  }
+  return resolve(dir);
+}
+
 export interface WorkspaceProvider {
   /** Provider type identifier */
   readonly type: string;
@@ -89,27 +156,49 @@ export interface WorkspaceProvider {
  */
 export class DefaultWorkspaceProvider implements WorkspaceProvider {
   readonly type = "default";
+  /** Original cwd as passed in; may differ from the detected project root. */
   readonly workspaceRoot: string | null;
+  /**
+   * Detected project root (git repo root, worktree main, or PI_LSP_PROJECT_ROOT).
+   * stateDir and workspace folders are derived from this so that every pi
+   * process in the same project shares one daemon, regardless of cwd.
+   */
+  readonly projectRoot: string | null;
   readonly stateDir: string | null;
 
   constructor(workspaceRoot?: string | null) {
     this.workspaceRoot = workspaceRoot ?? null;
-    this.stateDir = workspaceRoot ? resolveStateDir(workspaceRoot) : null;
+    // Derive the canonical project root before hashing, so processes whose cwd
+    // is a subdirectory, a git worktree, or a /tmp work dir all converge on the
+    // same stateDir (and thus the same daemon).
+    this.projectRoot = workspaceRoot ? resolveProjectRoot(workspaceRoot) : null;
+    this.stateDir = this.projectRoot ? resolveStateDir(this.projectRoot) : null;
   }
 
   getWorkspaceFolders(): { uri: string; name: string }[] {
-    return [];
+    // Return the project root as the LSP workspace folder. Previously this
+    // returned [], so in daemon/direct mode the server's workspaceFolder fell
+    // back to rootUri (= cwd). For subagents whose cwd is /tmp or a worktree,
+    // that meant the server looked for .vscode/settings.json and the solution
+    // file in the wrong place. Returning the real project root fixes that.
+    if (!this.projectRoot) return [];
+    return [{
+      uri: pathToFileURL(this.projectRoot).toString(),
+      name: this.projectRoot.split("/").pop() ?? "workspace",
+    }];
   }
 
   async ensureReady(_sessionId?: string): Promise<boolean> {
     if (!this.stateDir) return true;
     try {
       mkdirSync(join(this.stateDir, "sockets"), { recursive: true });
-      // Stamp the real root for human inspection / debugging.
-      if (this.workspaceRoot) {
+      // Stamp the real project root for human inspection / debugging. Use
+      // projectRoot (not the raw cwd) so multi-process daemon sharing is
+      // visible: every process that converged here wrote the same path.
+      if (this.projectRoot) {
         const rootStamp = join(this.stateDir, ".root");
         if (!existsSync(rootStamp)) {
-          writeFileSync(rootStamp, this.workspaceRoot, "utf-8");
+          writeFileSync(rootStamp, this.projectRoot, "utf-8");
         }
       }
       return true;
