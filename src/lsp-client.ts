@@ -91,6 +91,16 @@ export class LspClient {
    * version the server was told about.
    */
   private _documentVersions: Map<string, number> = new Map();
+  /**
+   * Per-URI pending flag for push-mode freshness. Set true on didOpen/didChange
+   * (a change the server hasn't yet reported on), cleared on the next
+   * publishDiagnostics. Push servers that lack pull support and typically omit
+   * the publish `version` (e.g. tsserver) can't be version-matched, so we deem
+   * the cache fresh once a publish lands after the last change. Correct under
+   * FIFO transport ordering — the publish arrives after the server processed
+   * our didChange.
+   */
+  private _diagnosticsPending: Map<string, boolean> = new Map();
   private _initialized = false;
   private _disposed = false;
   /** True if connected to a daemon socket (server init handled by daemon) */
@@ -164,10 +174,18 @@ export class LspClient {
     // Capability gate: never fire pull requests at servers that don't support them.
     const supportsPull = !!this._serverCapabilities?.diagnosticProvider;
     if (!supportsPull) {
+      // Push-mode freshness: a server without pull support reports via async
+      // publishDiagnostics. We deem the cache fresh once a publish has landed
+      // after the latest didOpen/didChange (see _diagnosticsPending). Relies on
+      // FIFO transport ordering (stdio transports are FIFO). Until that publish
+      // arrives the cache is non-fresh so callers can retry.
+      const pending = this._diagnosticsPending.get(uri) ?? true;
       return {
         diagnostics: this.getDiagnostics(uri),
-        fresh: false,
-        staleReason: "LSP server does not support pull diagnostics; showing last pushed diagnostics",
+        fresh: !pending,
+        staleReason: pending
+          ? "diagnostics not yet published for current document version"
+          : undefined,
       };
     }
 
@@ -253,6 +271,7 @@ export class LspClient {
       "textDocument/publishDiagnostics",
       (params: PublishDiagnosticsParams) => {
         this._diagnostics.set(params.uri, params.diagnostics);
+        this._diagnosticsPending.set(params.uri, false);
       }
     );
 
@@ -559,6 +578,7 @@ export class LspClient {
   /** Notify server of a newly opened document */
   didOpen(uri: string, languageId: string, version: number, text: string): void {
     this._documentVersions.set(uri, version);
+    this._diagnosticsPending.set(uri, true);
     this.sendNotification("textDocument/didOpen", {
       textDocument: { uri, languageId, version, text },
     });
@@ -567,6 +587,7 @@ export class LspClient {
   /** Notify server of a document change (full content sync) */
   didChange(uri: string, version: number, text: string): void {
     this._documentVersions.set(uri, version);
+    this._diagnosticsPending.set(uri, true);
     // Drop the stale resultId/version anchors: the document changed, so any
     // future `unchanged` response must be re-validated against the new version.
     this._lastFullDiagnosticVersion.delete(uri);
@@ -582,6 +603,7 @@ export class LspClient {
     this._diagnostics.delete(uri);
     this._diagnosticResultIds.delete(uri);
     this._lastFullDiagnosticVersion.delete(uri);
+    this._diagnosticsPending.delete(uri);
     this.sendNotification("textDocument/didClose", {
       textDocument: { uri },
     });

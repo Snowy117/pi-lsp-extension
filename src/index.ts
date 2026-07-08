@@ -76,9 +76,15 @@ async function pollForFreshDiagnostics(
   const deadlineMs = options.deadlineMs ?? (DIAGNOSTIC_SETTLE_DELAY_MS + 20_000);
   const start = Date.now();
 
-  // Initial settle so the server has a chance to process the didChange before
-  // we start polling (otherwise the very first poll races the notification).
-  await new Promise((r) => setTimeout(r, DIAGNOSTIC_SETTLE_DELAY_MS));
+  // Initial settle gives the server time to process didChange before the
+  // first poll. Only needed for pull-capable servers (an early pull returns
+  // pre-incremental-analysis cache). Push servers publish asynchronously, so
+  // we poll immediately and return fresh once a publish lands.
+  const initialClient = await manager.getClientForFile(filePath).catch(() => null);
+  const supportsPull = !!initialClient?.serverCapabilities?.diagnosticProvider;
+  if (supportsPull) {
+    await new Promise((r) => setTimeout(r, DIAGNOSTIC_SETTLE_DELAY_MS));
+  }
 
   for (;;) {
     // Re-resolve the client every iteration. getClientForFile returns null
