@@ -106,6 +106,8 @@ interface ClientConnection {
   id: number;
   socket: Socket;
   parser: MessageParser;
+  /** URIs this client opened via textDocument/didOpen (for didClose on disconnect). */
+  openDocuments: Set<string>;
 }
 
 // ── Main Daemon ────────────────────────────────────────────────────────────
@@ -196,6 +198,15 @@ function clientToServer(clientId: number, msg: JsonRpcMessage): void {
     }
   } else {
     // Notification from client — forward as-is
+    const params = msg.params as any;
+    const uri = params?.textDocument?.uri;
+    if (msg.method === "textDocument/didOpen" && uri) {
+      const conn = clients.get(clientId);
+      if (conn) conn.openDocuments.add(uri);
+    } else if (msg.method === "textDocument/didClose" && uri) {
+      const conn = clients.get(clientId);
+      if (conn) conn.openDocuments.delete(uri);
+    }
     lspProcess.stdin.write(encodeMessage(msg));
   }
 }
@@ -449,7 +460,7 @@ function startSocketServer(): Server {
       clientToServer(clientId, msg);
     });
 
-    const conn: ClientConnection = { id: clientId, socket, parser };
+    const conn: ClientConnection = { id: clientId, socket, parser, openDocuments: new Set() };
     clients.set(clientId, conn);
 
     // Hand the cached server capabilities to this client. The daemon did the
@@ -468,6 +479,27 @@ function startSocketServer(): Server {
 
     socket.on("close", () => {
       log(`Client ${clientId} disconnected`);
+      const conn = clients.get(clientId);
+
+      // Send didClose for documents this client opened that no OTHER client
+      // also has open. Without this, the server retains stale open documents
+      // after a client disconnects; a reconnecting client's didOpen would be
+      // rejected (document already open) and diagnostics would silently fail.
+      if (conn && lspProcess.stdin?.writable) {
+        for (const uri of conn.openDocuments) {
+          const stillOpen = Array.from(clients.values())
+            .filter(c => c.id !== clientId)
+            .some(c => c.openDocuments.has(uri));
+          if (!stillOpen) {
+            lspProcess.stdin.write(encodeMessage({
+              jsonrpc: "2.0",
+              method: "textDocument/didClose",
+              params: { textDocument: { uri } },
+            }));
+          }
+        }
+      }
+
       clients.delete(clientId);
 
       // Clean up pending requests for this client

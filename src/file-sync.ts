@@ -193,4 +193,22 @@ export class FileSync {
   get trackedCount(): number {
     return this.tracked.size;
   }
+
+  /**
+   * Clear all tracked documents for a specific language.
+   *
+   * Called when the LSP server for that language (re)starts. When the daemon
+   * is restarted (e.g. pi restart), the new server has NO open documents, but
+   * FileSync's tracked map still has entries from the previous session. Without
+   * clearing, handleFileWrite sends didChange for files the new server never
+   * received a didOpen for — the server silently ignores them and pull
+   * diagnostics return empty. Clearing forces a didOpen on the next access.
+   */
+  clearTrackedByLanguage(languageId: string): void {
+    for (const [uri, doc] of this.tracked) {
+      if (doc.languageId === languageId) {
+        this.tracked.delete(uri);
+      }
+    }
+  }
 }

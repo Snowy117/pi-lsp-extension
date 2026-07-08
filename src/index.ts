@@ -245,6 +245,10 @@ export default function lspExtension(pi: ExtensionAPI) {
     },
     onServerStart: (languageId: string, command: string) => {
       setLspStatus("warning", `LSP: starting ${languageId} (${command})...`);
+      // Clear tracked documents for this language so the new/reconnected
+      // client re-sends didOpen instead of didChange for files the new
+      // server never opened (stale tracked entries from a previous daemon).
+      fileSync?.clearTrackedByLanguage(languageId);
     },
     onServerReady: (languageId: string) => {
       setLspStatus("accent", `LSP: ${languageId} ready`);
