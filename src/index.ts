@@ -387,7 +387,14 @@ export default function lspExtension(pi: ExtensionAPI) {
     },
   });
 
-  pi.registerTool(createDiagnosticsTool(managerProxy, treeSitterProxy));
+  // Lazy proxy for FileSync so tools always see the live instance even though
+  // it's created lazily inside getManager(). Tools only call handleFileRead at
+  // execution time (not registration time), so the proxy resolves then.
+  const fileSyncProxy = {
+    handleFileRead: (filePath: string) => getFileSync().handleFileRead(filePath),
+  };
+
+  pi.registerTool(createDiagnosticsTool(managerProxy, treeSitterProxy, fileSyncProxy));
   pi.registerTool(createHoverTool(managerProxy, treeSitterProxy));
   pi.registerTool(createDefinitionTool(managerProxy, treeSitterProxy, workspaceIndexProxy));
   pi.registerTool(createReferencesTool(managerProxy, treeSitterProxy));

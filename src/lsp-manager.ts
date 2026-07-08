@@ -409,6 +409,7 @@ export class LspManager {
 
     if (stateDir) {
       // Spawn daemon and connect via socket
+      let lockPath: string | null = null;
       try {
         // Acquire a spawn lock to prevent multiple pi processes from each
         // spawning a daemon when they start concurrently (classic TOCTOU:
@@ -416,14 +417,16 @@ export class LspManager {
         // one wins and the other's daemon is orphaned or half-initialized).
         // The winner spawns; losers skip the spawn and enter the shared
         // connect-retry loop below to pick up the winner's daemon.
-        const lockPath = this.getSocketPath(languageId)!.replace(/\.sock$/, ".spawn.lock");
+        // The lock is held until connection succeeds (or all retries fail) so
+        // that a second process cannot acquire it, spawn a competing daemon,
+        // and clobber the socket while the first daemon is still starting up.
+        lockPath = this.getSocketPath(languageId)!.replace(/\.sock$/, ".spawn.lock");
         const spawnedByUs = await this.tryAcquireSpawnLock(lockPath);
         if (spawnedByUs) {
-          try {
-            await this.spawnDaemon(languageId, config, effectiveArgs, workspaceFolders, initializationOptions);
-          } finally {
-            this.releaseSpawnLock(lockPath);
-          }
+          await this.spawnDaemon(languageId, config, effectiveArgs, workspaceFolders, initializationOptions);
+        } else {
+          // Lost the lock — another process is spawning. Don't release on exit.
+          lockPath = null;
         }
         // Small delay to let daemon start listening
         await new Promise((r) => setTimeout(r, DAEMON_SOCKET_READY_DELAY_MS));
@@ -451,6 +454,12 @@ export class LspManager {
             this._restartAttempts.delete(languageId);
             this._restartBackoff.delete(languageId);
             this.triggerPostInit(languageId, client);
+            // Connection succeeded — release the spawn lock so future spawns
+            // (after this daemon dies) aren't blocked.
+            if (lockPath) {
+              this.releaseSpawnLock(lockPath);
+              lockPath = null;
+            }
             return client;
           } catch (err: any) {
             lastErr = err;
@@ -463,6 +472,10 @@ export class LspManager {
         }
         throw lastErr ?? new Error("Failed to connect to daemon");
       } catch (err: any) {
+        // Release the spawn lock on any failure path so a later attempt isn't blocked.
+        if (lockPath) {
+          this.releaseSpawnLock(lockPath);
+        }
         // Fall back to direct mode — log the daemon failure
         this._callbacks.onServerError?.(languageId, `Daemon mode failed, falling back to direct: ${err.message}`);
         this.startingServers.delete(languageId);

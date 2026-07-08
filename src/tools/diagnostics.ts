@@ -51,6 +51,7 @@ interface DiagnosticsDetails {
 export function createDiagnosticsTool(
   manager: LspManager,
   treeSitter?: TreeSitterManager | null,
+  fileSync?: { handleFileRead(filePath: string): Promise<void> } | null,
 ): ToolDefinition<typeof DiagnosticsParams, DiagnosticsDetails> {
   return {
     name: "lsp_diagnostics",
@@ -75,6 +76,12 @@ export function createDiagnosticsTool(
       if (client) {
         // LSP path
         const uri = manager.getFileUri(filePath);
+        // Ensure the file is open in the LSP server before pulling diagnostics.
+        // If the file was never read/written/edited (e.g. a direct lsp_diagnostics
+        // call), the server has no knowledge of it and pull returns empty.
+        if (fileSync) {
+          await fileSync.handleFileRead(filePath).catch(() => {});
+        }
         const refreshResult = await client.refreshDiagnosticsWithFreshness(uri);
         const diagnostics = refreshResult.diagnostics;
 
