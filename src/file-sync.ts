@@ -167,6 +167,21 @@ export class FileSync {
     }
   }
 
+  handleFileDelete(filePath: string): void {
+    const absPath = this.manager.resolvePath(filePath);
+    const uri = this.manager.getFileUri(absPath);
+    const existing = this.tracked.get(uri);
+
+    if (this.treeSitter) {
+      this.treeSitter.invalidate(absPath);
+    }
+    this.workspaceIndex?.removeFile(absPath);
+
+    if (!existing) return;
+    this.tracked.delete(uri);
+    this.manager.getRunningClient(existing.languageId)?.didClose(uri);
+  }
+
   /**
    * Get the current tracked version for a URI, or null if not tracked.
    * Used by tools that need to send temporary didChange notifications

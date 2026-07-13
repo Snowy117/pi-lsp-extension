@@ -21,10 +21,10 @@ LSP servers start lazily — they only spin up when a tool is first used on a fi
 
 ## Auto-diagnostics
 
-After a successful `write` or `edit`, if an LSP server is already running for that file type, the extension automatically appends compilation errors to the tool result. This gives the LLM immediate feedback without requiring a separate `lsp_diagnostics` call.
+After a successful `write`, `edit`, or `apply_patch`, the extension synchronizes changed files with their LSP server and appends compilation errors to the tool result. `apply_patch` is supported when [pi-apply-patch](../pi-apply-patch) is installed; every added or updated file is checked, while deleted tracked files are closed in the server.
 
-- Scoped to the single changed file (no workspace-wide noise)
-- Only errors, max 10 lines — keeps context lean
+- Scoped to changed files only (no workspace-wide noise)
+- Errors and other diagnostics, capped at 20 lines per file
 - Only fires when a server is already running (no lazy startup)
 
 ## Installation
@@ -82,9 +82,9 @@ Add more at runtime:
 
 1. **Lazy startup** — servers start on first tool use for a file type (or eagerly via [`.pi-lsp.json`](#project-config))
 2. **Tree-sitter fallback** — when no LSP server is running, tools like `lsp_diagnostics`, `lsp_hover`, `lsp_definition`, and `lsp_symbols` fall back to tree-sitter for syntax errors, signatures, and symbol extraction
-3. **File sync** — pi's `read`/`write`/`edit` operations are automatically synced to the LSP via `didOpen`/`didChange`, with LRU eviction (`didClose`) after 100 tracked files
+3. **File sync** — pi's `read`/`write`/`edit` operations, plus `apply_patch` changes when the companion extension is installed, are automatically synced to the LSP via `didOpen`/`didChange`, with LRU eviction (`didClose`) after 100 tracked files
 4. **Diagnostics cache** — the server pushes diagnostics asynchronously; tools read from a local cache
-5. **Auto-diagnostics** — errors are appended to write/edit results when a server is running
+5. **Auto-diagnostics** — errors are appended to write/edit/apply_patch results when a server is running
 6. **Shared daemons** — in supported workspaces, LSP servers run as background daemons shared across pi sessions
 
 ## Lombok Support (Java)
@@ -125,7 +125,7 @@ Create a `.pi-lsp.json` file in your project root to configure LSP behavior per-
 |-------|-------------|
 | `autoStart` | Array of language IDs to start eagerly on session launch. Servers begin initializing in the background immediately — no need to wait for the first tool call. Ideal for slow servers like `jdtls`. |
 | `lombokJar` | Path to a Lombok jar (absolute or relative to project root), or `"auto"` to auto-detect in Brazil workspaces. Applied before auto-start so jdtls launches with the correct `-javaagent` flag. |
-| `autoInjectDiagnostics` | Controls whether LSP errors are auto-appended to `write`/`edit` tool results. `true` (default) enables for all languages, `false` disables entirely, or pass an array of language IDs (e.g. `["typescript"]`) to enable selectively. Disable for Java/Brazil workspaces where Lombok and dependency-chain false positives create noise. |
+| `autoInjectDiagnostics` | Controls whether LSP errors are auto-appended to `write`/`edit`/`apply_patch` tool results. `true` (default) enables for all languages, `false` disables entirely, or pass an array of language IDs (e.g. `["typescript"]`) to enable selectively. Disable for Java/Brazil workspaces where Lombok and dependency-chain false positives create noise. |
 | `servers` | Custom server configs keyed by language ID. Overrides the built-in defaults. Each entry has `command`, optional `args` (string array), and optional `env` (key-value pairs). |
 
 The config file is loaded once at session start. Changes require restarting the pi session.

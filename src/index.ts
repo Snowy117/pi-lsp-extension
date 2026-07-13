@@ -52,6 +52,83 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { DIAGNOSTIC_SETTLE_DELAY_MS } from "./shared/timing.js";
 
+type FileMutation = {
+  path: string;
+  deleted: boolean;
+};
+
+const APPLY_PATCH_HEADERS: Array<{ prefix: string; deleted: boolean }> = [
+  { prefix: "*** Add File: ", deleted: false },
+  { prefix: "*** Update File: ", deleted: false },
+  { prefix: "*** Delete File: ", deleted: true },
+];
+
+function getApplyPatchMutations(input: unknown): FileMutation[] {
+  if (typeof input !== "string") return [];
+
+  const mutations: FileMutation[] = [];
+  for (const line of input.split(/\r?\n/)) {
+    const header = APPLY_PATCH_HEADERS.find(({ prefix }) => line.startsWith(prefix));
+    if (!header) continue;
+    const path = line.slice(header.prefix.length).trim();
+    if (path) mutations.push({ path, deleted: header.deleted });
+  }
+  return mutations;
+}
+
+function formatDiagnosticSummary(
+  manager: LspManager,
+  path: string,
+  refreshResult: DiagnosticRefreshResult,
+): string | null {
+  if (!refreshResult.fresh) return null;
+
+  const errors = refreshResult.diagnostics.filter(
+    (diagnostic) => !diagnostic.severity || diagnostic.severity === DiagnosticSeverity.Error,
+  );
+  const others = refreshResult.diagnostics
+    .filter(
+      (diagnostic) =>
+        diagnostic.severity !== undefined &&
+        diagnostic.severity !== DiagnosticSeverity.Error,
+    )
+    .sort((a, b) => a.severity! - b.severity!);
+
+  if (errors.length === 0 && others.length === 0) return null;
+
+  const maxDiagnosticLines = 20;
+  const relPath = relative(manager.resolvePath("."), manager.resolvePath(path));
+  const severityLabel = (diagnostic: Diagnostic): string => {
+    switch (diagnostic.severity) {
+      case DiagnosticSeverity.Warning:
+        return "warning";
+      case DiagnosticSeverity.Hint:
+        return "hint";
+      case DiagnosticSeverity.Information:
+        return "info";
+      default:
+        return "error";
+    }
+  };
+  const formatDiagnostic = (diagnostic: Diagnostic): string => {
+    const line = diagnostic.range.start.line + 1;
+    const col = diagnostic.range.start.character + 1;
+    const source = diagnostic.source ? ` [${diagnostic.source}]` : "";
+    const code = diagnostic.code !== undefined ? ` (${diagnostic.code})` : "";
+    return `${relPath}:${line}:${col} ${severityLabel(diagnostic)}: ${diagnostic.message}${code}${source}`;
+  };
+
+  const diagnostics = [...errors, ...others];
+  const lines = diagnostics.slice(0, maxDiagnosticLines).map(formatDiagnostic);
+  if (diagnostics.length > maxDiagnosticLines) {
+    lines.push(`... and ${diagnostics.length - maxDiagnosticLines} more diagnostic(s)`);
+  }
+
+  const errorPart = errors.length > 0 ? `${errors.length} error(s)` : "no errors";
+  const otherPart = others.length > 0 ? `, ${others.length} other diagnostic(s)` : "";
+  return `\n\n⚠ LSP: ${errorPart}${otherPart} in ${relPath}:\n${lines.join("\n")}`;
+}
+
 /**
  * Poll the server for fresh diagnostics until it returns a `fresh` report
  * (full report, or an `unchanged` confirmed against the current document
@@ -422,10 +499,14 @@ export default function lspExtension(pi: ExtensionAPI) {
   }));
   pi.registerTool(createCodeActionsTool(managerProxy, treeSitterProxy));
 
-  // File sync: track file reads/writes/edits
-  // After writes/edits, append file-scoped error diagnostics to the tool result
   pi.on("tool_result", async (event) => {
     const sync = getFileSync();
+    const writeOrEdit = isWriteToolResult(event) || isEditToolResult(event);
+    const mutations: FileMutation[] = !event.isError && event.toolName === "apply_patch"
+      ? getApplyPatchMutations((event.input as { input?: unknown } | undefined)?.input)
+      : writeOrEdit && !event.isError && typeof (event.input as { path?: unknown } | undefined)?.path === "string"
+        ? [{ path: (event.input as { path: string }).path, deleted: false }]
+        : [];
 
     try {
       if (isReadToolResult(event) && !event.isError) {
@@ -433,132 +514,45 @@ export default function lspExtension(pi: ExtensionAPI) {
         if (path) await sync.handleFileRead(path);
       }
 
-      if (isWriteToolResult(event) && !event.isError) {
-        const path = (event.input as any)?.path;
-        if (path) await sync.handleFileWrite(path);
-      }
-
-      if (isEditToolResult(event) && !event.isError) {
-        const path = (event.input as any)?.path;
-        if (path) await sync.handleFileWrite(path);
+      for (const mutation of mutations) {
+        if (mutation.deleted) {
+          sync.handleFileDelete(mutation.path);
+        } else {
+          await sync.handleFileWrite(mutation.path);
+        }
       }
     } catch {
-      // File sync errors are non-fatal
     }
 
-    // Auto-append diagnostics for the changed file (write/edit only)
-    if ((isWriteToolResult(event) || isEditToolResult(event)) && !event.isError && manager) {
-      const path = (event.input as any)?.path;
-      if (!path) return;
+    if (mutations.length > 0 && manager) {
+      const summaries: string[] = [];
+      const paths = new Set(mutations.filter((mutation) => !mutation.deleted).map((mutation) => mutation.path));
 
-      const languageId = manager.getLanguageId(path);
-      if (!languageId) return;
+      for (const path of paths) {
+        const languageId = manager.getLanguageId(path);
+        if (!languageId) continue;
 
-      // Check autoInjectDiagnostics config
-      const inject = projectConfig?.autoInjectDiagnostics;
-      if (inject === false) return;
-      if (Array.isArray(inject) && !inject.includes(languageId)) return;
+        const inject = projectConfig?.autoInjectDiagnostics;
+        if (inject === false) continue;
+        if (Array.isArray(inject) && !inject.includes(languageId)) continue;
 
-      // Use getClientForFile (not getRunningClient) so we await server startup
-      // instead of silently bailing when the daemon is mid-(re)handshake.
-      // (The actual client used for each poll is re-resolved inside
-      // pollForFreshDiagnostics to survive daemon restarts mid-poll.)
-      const client = await manager.getClientForFile(path).catch(() => null);
-      if (!client) return;
+        const client = await manager.getClientForFile(path).catch(() => null);
+        if (!client) continue;
 
-      const uri = manager.getFileUri(path);
-      // Poll for fresh diagnostics instead of a single fixed delay: heavy
-      // servers (Roslyn) may still be mid-analysis 8s after didChange, in
-      // which case the first pull returns the stale cache or `unchanged`.
-      // We retry until the server returns a fresh report (full, or unchanged
-      // against the post-change version), with a total deadline to avoid
-      // blocking the tool result indefinitely.
-      //
-      // Each poll re-resolves the client through the manager so a daemon
-      // socket that died and is being restarted mid-poll is picked up
-      // instead of pinning the dead instance and returning its stale cache.
-      const refreshResult = await pollForFreshDiagnostics(manager, path, uri);
-      // If we could not obtain a fresh report (server not initialized, died,
-      // or timed out), do NOT inject potentially-stale diagnostics — the user
-      // can call lsp_diagnostics explicitly to confirm. Injecting cached
-      // pre-edit diagnostics after a fix is exactly the staleness bug we are
-      // solving.
-      if (!refreshResult.fresh) return;
-      const diagnostics = refreshResult.diagnostics;
-
-      // Severity bucketing: errors first, then everything else in severity
-      // order (Warning → Hint → Informational). Unspecified severity (0) is
-      // treated as Error per the LSP spec's default-severity rule.
-      const errors = diagnostics.filter(
-        (d) => !d.severity || d.severity === DiagnosticSeverity.Error
-      );
-      const others = diagnostics
-        .filter(
-          (d) =>
-            d.severity !== undefined &&
-            d.severity !== DiagnosticSeverity.Error
-        )
-        .sort((a, b) => (a.severity! - b.severity!));
-
-      if (errors.length === 0 && others.length === 0) return;
-
-      // Build a compact summary — errors first, then other severities,
-      // capped at MAX_DIAGNOSTIC_LINES total lines.
-      const MAX_DIAGNOSTIC_LINES = 20;
-      const relPath = relative(manager.resolvePath("."), manager.resolvePath(path));
-
-      const severityLabel = (d: Diagnostic): string => {
-        switch (d.severity) {
-          case DiagnosticSeverity.Warning:
-            return "warning";
-          case DiagnosticSeverity.Hint:
-            return "hint";
-          case DiagnosticSeverity.Information:
-            return "info";
-          default:
-            return "error"; // Error or unspecified
-        }
-      };
-
-      const formatDiag = (d: Diagnostic): string => {
-        const line = d.range.start.line + 1;
-        const col = d.range.start.character + 1;
-        const source = d.source ? ` [${d.source}]` : "";
-        const code = d.code !== undefined ? ` (${d.code})` : "";
-        return `${relPath}:${line}:${col} ${severityLabel(d)}: ${d.message}${code}${source}`;
-      };
-
-      const lines: string[] = [];
-      const total = errors.length + others.length;
-      let suppressed = 0;
-
-      for (const d of errors) {
-        if (lines.length >= MAX_DIAGNOSTIC_LINES) { suppressed = total - lines.length; break; }
-        lines.push(formatDiag(d));
-      }
-      if (lines.length < MAX_DIAGNOSTIC_LINES) {
-        for (const d of others) {
-          if (lines.length >= MAX_DIAGNOSTIC_LINES) { suppressed = total - lines.length; break; }
-          lines.push(formatDiag(d));
-        }
-      }
-      if (suppressed > 0) {
-        lines.push(`... and ${suppressed} more diagnostic(s)`);
+        const uri = manager.getFileUri(path);
+        const refreshResult = await pollForFreshDiagnostics(manager, path, uri);
+        const summary = formatDiagnosticSummary(manager, path, refreshResult);
+        if (summary) summaries.push(summary);
       }
 
-      const errorPart = errors.length > 0 ? `${errors.length} error(s)` : "no errors";
-      const otherPart = others.length > 0 ? `, ${others.length} other diagnostic(s)` : "";
-      const freshnessNote = refreshResult.fresh
-        ? ""
-        : ` [may be stale — ${refreshResult.staleReason ?? "results may be stale"}; run lsp_diagnostics to confirm]`;
-      const summary = `\n\n⚠ LSP: ${errorPart}${otherPart} in ${relPath}${freshnessNote}:\n${lines.join("\n")}`;
-
-      return {
-        content: [
-          ...event.content,
-          { type: "text" as const, text: summary },
-        ],
-      };
+      if (summaries.length > 0) {
+        return {
+          content: [
+            ...event.content,
+            { type: "text" as const, text: summaries.join("") },
+          ],
+        };
+      }
     }
   });
 
