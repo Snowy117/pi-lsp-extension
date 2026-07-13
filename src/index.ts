@@ -147,7 +147,11 @@ async function pollForFreshDiagnostics(
   manager: LspManager,
   filePath: string,
   uri: string,
-  options: { intervalMs?: number; deadlineMs?: number } = {},
+  options: {
+    intervalMs?: number;
+    deadlineMs?: number;
+    ensureDocumentOpen?: () => Promise<void>;
+  } = {},
 ): Promise<DiagnosticRefreshResult> {
   const intervalMs = options.intervalMs ?? 1000;
   const deadlineMs = options.deadlineMs ?? (DIAGNOSTIC_SETTLE_DELAY_MS + 20_000);
@@ -166,10 +170,18 @@ async function pollForFreshDiagnostics(
   for (;;) {
     // Re-resolve the client every iteration. getClientForFile returns null
     // while a restart is in flight; that counts as not-fresh and we retry.
-    const client = await manager.getClientForFile(filePath).catch(() => null);
-    if (client) {
-      const result = await client.refreshDiagnosticsWithFreshness(uri);
-      if (result.fresh) return result;
+    const availableClient = await manager.getClientForFile(filePath).catch(() => null);
+    if (availableClient) {
+      // A daemon may restart during the settle delay. The manager then clears
+      // FileSync's tracked entry, so reopening here sends didOpen to the new
+      // server before the diagnostic pull. Merely re-resolving the client is
+      // insufficient because the replacement server has no open documents.
+      await options.ensureDocumentOpen?.();
+      const client = await manager.getClientForFile(filePath).catch(() => null);
+      if (client) {
+        const result = await client.refreshDiagnosticsWithFreshness(uri);
+        if (result.fresh) return result;
+      }
     }
     if (Date.now() - start >= deadlineMs) {
       // Final attempt: return whatever the manager can give us so the caller
@@ -507,7 +519,6 @@ export default function lspExtension(pi: ExtensionAPI) {
       : writeOrEdit && !event.isError && typeof (event.input as { path?: unknown } | undefined)?.path === "string"
         ? [{ path: (event.input as { path: string }).path, deleted: false }]
         : [];
-
     try {
       if (isReadToolResult(event) && !event.isError) {
         const path = (event.input as any)?.path;
@@ -540,7 +551,9 @@ export default function lspExtension(pi: ExtensionAPI) {
         if (!client) continue;
 
         const uri = manager.getFileUri(path);
-        const refreshResult = await pollForFreshDiagnostics(manager, path, uri);
+        const refreshResult = await pollForFreshDiagnostics(manager, path, uri, {
+          ensureDocumentOpen: () => sync.handleFileRead(path),
+        });
         const summary = formatDiagnosticSummary(manager, path, refreshResult);
         if (summary) summaries.push(summary);
       }
